@@ -1,0 +1,68 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"clangd.arguments": [
+			"--header-insertion=never"
+		],
+		"editor.tabSize": 4
+	},
+	"tasks": {
+		"version": "2.0.0",
+		"tasks": [
+			{
+				"label": "configure",
+				"type": "shell",
+				"command": ["premake5 --file=build.lua ecc && premake5 --file=build.lua gmake2"],
+				"problemMatcher": [],
+				"presentation": {
+					"reveal": "always",
+					"clear": true,
+					"focus": false,
+					"showReuseMessage": true
+				}
+			},
+			{
+				"dependsOn": [ "configure" ],
+				"label": "build",
+				"options": { "cwd": "${workspaceFolder}/build/makefiles" },
+				"command": "make config=debug",
+				"type": "shell",
+				"args": [],
+				"problemMatcher": [
+					"$gcc"
+				],
+				"presentation": {
+					"reveal": "always",
+					"clear": true,
+					"focus": false,
+					"showReuseMessage": true
+				},
+				"group": "build"
+			}
+		]
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "launch",
+				"type": "cppdbg",
+				"request": "launch",
+				"program": "${workspaceFolder}/build/bin/app",
+				"stopAtEntry": false,
+				"cwd": "${workspaceFolder}",
+				"externalConsole": false,
+				"setupCommands": [
+					{
+						"text": "-enable-pretty-printing",
+						"ignoreFailures": true
+					}
+				]
+			}
+		]
+	},
+}

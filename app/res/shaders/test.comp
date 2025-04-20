@@ -1,0 +1,207 @@
+#version 460
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (set = 1, binding = 0, rgba8) uniform writeonly image2D image;
+layout (set = 1, binding = 1) uniform sampler2D texture_maps[3];
+layout (set = 1, binding = 2) uniform sampler2D normal_maps[3];
+
+#define FLT_MAX 3.4028235e38
+
+struct ray {
+    vec3 origin;
+    vec3 dir;
+};
+
+struct sphere {
+    vec3 pos;
+    float r;
+    vec3 col;
+    float rot_y;
+};
+
+layout (set = 0, binding = 1) uniform Global {
+    vec3 cam_pos;
+    mat4 inv_proj;
+    mat4 inv_view;
+    sphere spheres[3];
+
+    float atmosphere_size;
+    float density_falloff;
+    int num_optical_depth_points;
+    int num_in_scatter_points;
+    vec3 scattering_coefficients;
+} global;
+
+vec2 ray_sphere(vec3 sphere_centre, float sphere_radius, vec3 ray_origin, vec3 ray_dir) {
+    vec3 offset = ray_origin - sphere_centre;
+    float a = 1.0;
+    float b = 2.0 * dot(offset, ray_dir);
+    float c = dot(offset, offset) - sphere_radius * sphere_radius;
+    float d = b * b - 4.0 * a * c;
+
+    if (d > 0.0) {
+        float s = sqrt(d);
+        float dst_to_sphere_near = max(0.0, (-b - s) / (2.0 * a));
+        float dst_to_sphere_far = (-b + s) / (2.0 * a);
+        
+        if (dst_to_sphere_far >= 0.0) {
+            return vec2(dst_to_sphere_near, dst_to_sphere_far - dst_to_sphere_near);
+        }
+    }
+    
+    return vec2(FLT_MAX, 0.0);
+}
+
+
+ray get_view_ray(ivec2 pixel_coords) {
+    ray r;
+    r.origin = global.cam_pos;
+
+    ivec2 image_size = imageSize(image);
+    vec2 coord = vec2(pixel_coords) / vec2(image_size);
+    coord = coord * 2.0 - 1.0;
+
+    vec4 target = global.inv_proj * vec4(coord.x, coord.y, 1, 1);
+    r.dir = vec3(global.inv_view * vec4(normalize(vec3(target) / target.w), 0));
+
+    return r;
+}
+
+vec2 sphere_uv(vec3 p, float rot_y) {
+    float u = atan(p.z, p.x) / (2.0 * 3.14159265359) + 0.5;
+
+    u += rot_y;
+    u = mod(u, 1.0);
+
+    float v = asin(p.y) / 3.14159265359 + 0.5;
+    return 1 - vec2(u, v);
+}
+
+vec3 get_tex_color(vec3 p, int tex_index, float rot_y) {
+    vec2 uv = sphere_uv(normalize(p), rot_y);
+    return texture(texture_maps[tex_index], uv).rgb;
+}
+
+vec3 trace_ray(ray r, out float depth) {
+    int closest_sphere = -1;
+    float hit_dist = FLT_MAX;
+
+    for (int i = 0; i < 3; i++) {
+        float radius = global.spheres[i].r;
+
+        vec3 origin = r.origin - global.spheres[i].pos;
+        float a = dot(r.dir, r.dir);
+        float b = 2.0 * dot(origin, r.dir);
+        float c = dot(origin, origin) - radius * radius;
+
+        float disc = b * b - 4.0 * a * c;
+
+        float t1 = (-b - sqrt(disc)) / (2 * a);
+        if (disc < 0.0 || t1 < 0.0) {
+            continue;
+        }
+
+        if (t1 < hit_dist) {
+            hit_dist = t1;
+            closest_sphere = i;
+        }
+    }
+
+    depth = hit_dist;
+
+    if (closest_sphere == -1) {
+        return vec3(0, 0, 0);
+    }
+        
+    vec3 origin = r.origin - global.spheres[closest_sphere].pos;
+    float rot_y = global.spheres[closest_sphere].rot_y;
+    vec3 hit_point = origin + r.dir * hit_dist;
+
+    vec3 tex_col = get_tex_color(hit_point, closest_sphere, rot_y);
+    vec3 normal = normalize(hit_point);
+
+    vec3 norm_col = texture(normal_maps[closest_sphere], sphere_uv(normal, rot_y)).rgb * 2.0 - 1.0;
+    vec3 T = normalize(vec3(-normal.z, 0, normal.x));
+    vec3 B = cross(normal, T);
+
+    mat3 TBN = mat3(T, B, normal);
+    vec3 final_normal = TBN * norm_col;
+
+    vec3 light_dir = normalize(vec3(1, 0, 0));
+    float light_fac = max(dot(mix(normal, final_normal, 1), -light_dir), 0.0);
+
+    vec3 sphere_col = tex_col * global.spheres[closest_sphere].col * light_fac;
+
+    if (closest_sphere == 2) {
+        sphere_col = tex_col * 2;
+    }
+
+    return sphere_col;
+}
+
+float density_at_point(vec3 sample_point) {
+    float height_above_surface = length(sample_point - global.spheres[0].pos) - global.spheres[0].r;
+    float h01 = height_above_surface / ((global.spheres[0].r * (1 + global.atmosphere_size)) - global.spheres[0].r);
+    float local_density = exp(-h01 * global.density_falloff) * (1 - h01);
+    return local_density;
+}
+
+float optical_depth(ray r, float ray_len) {
+    vec3 sample_point = r.origin;
+    float step_size = ray_len / (global.num_optical_depth_points - 1);
+    float opt_depth = 0;
+
+    for (int i = 0; i < global.num_optical_depth_points; i++) {
+        float local_density = density_at_point(sample_point);
+        opt_depth += local_density * step_size;
+        sample_point += r.dir * step_size;
+    }
+
+    return opt_depth;
+}
+
+vec3 calculate_light(ray r, float ray_len, vec3 original_col) {
+    vec3 in_scatter_point = r.origin;
+    float step_size = ray_len / (global.num_in_scatter_points - 1);
+    vec3 in_scattered_light = vec3(0);
+    float view_ray_optical_depth = 0;
+
+    for (int i = 0; i < global.num_in_scatter_points; i++) {
+        float sun_ray_len = ray_sphere(global.spheres[0].pos, global.spheres[0].r * (1 + global.atmosphere_size), in_scatter_point, vec3(-1, 0, 0)).y;
+        float sun_ray_optical_depth = optical_depth(ray(in_scatter_point, vec3(-1, 0, 0)), sun_ray_len);
+        view_ray_optical_depth = optical_depth(ray(in_scatter_point, -r.dir), step_size * i);
+        vec3 transmittance = exp(-(sun_ray_optical_depth + view_ray_optical_depth) * global.scattering_coefficients);
+        float local_density = density_at_point(in_scatter_point);
+
+        in_scattered_light += local_density * transmittance * global.scattering_coefficients * step_size;
+        in_scatter_point += r.dir * step_size;
+    }
+
+    float original_col_transmittance = exp(-view_ray_optical_depth);
+    return original_col * original_col_transmittance + in_scattered_light;
+}
+
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ray view_ray = get_view_ray(pixel_coords);
+    float depth = 0;
+    vec3 final_col = trace_ray(view_ray, depth);
+
+    // atmosphere:
+    vec2 hit_info = ray_sphere(global.spheres[0].pos, global.spheres[0].r * (1 + global.atmosphere_size), view_ray.origin, view_ray.dir);
+    float dst_to_atmosphere = hit_info.x;
+    float dst_thru_atmosphere = min(hit_info.y, depth - hit_info.x);
+
+    if (dst_thru_atmosphere > 0) {
+        float epsilon = 0.001;
+        vec3 point_in_atmosphere = view_ray.origin + view_ray.dir * (dst_to_atmosphere + epsilon);
+        vec3 light = calculate_light(ray(point_in_atmosphere, view_ray.dir), dst_thru_atmosphere, final_col);
+
+        final_col = light;
+    }
+
+    // final_col = vec3(dst_thru_atmosphere / ((global.spheres[0].r * (1 + global.atmosphere_size)) * 2)) * (view_ray.dir * 0.5 + 0.5);
+
+    imageStore(image, pixel_coords, vec4(final_col, 1.0));
+}
